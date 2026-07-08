@@ -6,6 +6,7 @@ This subfolder contains the implementation of several Tracking tools for FCC-ee 
 * PlotTrackHitResiduals
 * TrackdNdxDelphesBased
 * TracksFromGenParticles
+* StandaloneMuonTracking
 
 ## Geometric Graph Track Finding
 
@@ -169,5 +170,25 @@ After the fit:
 2. A new `edm4hep::Track` is created.
 3. Track states and covariance matrices are stored.
 4. The results are written to the output collection.
+
+## Standalone Muon Tracking
+
+**StandaloneMuonTracking** is a Gaudi MultiTransformer that reconstructs tracks directly
+from IDEA Muon-System tracker hits, without relying on hits from any other sub-detector.
+
+Given a `TrackerHitPlaneCollection`, it searches for track candidates through an N-hit
+combinatorial circle fit (with configurable outlier, isolation, road, and neighbour-track
+quality cuts), and can optionally refine the result with a GenFit Kalman/DAF fit. It also
+supports propagating the track inward through the solenoid boundary, either analytically
+or via RK4 stepping, to obtain a state near the interaction point — useful for both prompt
+and displaced muons.
+
+It is implemented in `components/StandaloneMuonTracking.{h,cpp}` and reuses the shared
+`GenfitField`/`GenfitMaterialInterface` adapters from `include/genfit_interfaces/` (the
+same ones used by the Genfit Track Fitter above) for the magnetic field and material
+effects passed to GenFit.
+
+A steering-file example is provided in
+[test/testStandaloneMuonTracking/runStandaloneMuonTracking.py](test/testStandaloneMuonTracking/runStandaloneMuonTracking.py).
 
 
