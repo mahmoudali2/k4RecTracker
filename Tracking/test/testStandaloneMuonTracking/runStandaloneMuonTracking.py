@@ -12,9 +12,18 @@ from Configurables import EventDataSvc
 from Configurables import StandaloneMuonTracking
 from Configurables import GeoSvc
 
-# Geometry service - provides access to detector geometry
+# Geometry service - provides access to detector geometry.
+# IMPORTANT: the compact MUST match the geometry the input file was digitised
+# with. The muon-system configurations use dedicated compacts, NOT the nominal
+# IDEA_o1_v03.xml; feeding a 3L/4L digi file to the nominal compact still
+# "works" but wrecks everything downstream of pattern recognition (analytical
+# inner propagation 94% -> 35%, charge-sign correctness 77% -> 45%).
+#   3L_30cm -> IDEA_3L_30cm.xml      4L_50cm -> IDEA_MS_4L_50cm.xml
+# (see IDEA_muon_optimization/gen_tracking_steerings.py for the full mapping)
 geoservice = GeoSvc("GeoSvc")
-geoservice.detectors = [os.environ["K4GEO"] + "/FCCee/IDEA/compact/IDEA_o1_v03/IDEA_o1_v03.xml"]
+# This compact matches iosvc.Input below (the 3L_30cm muon-gun digi file).
+# Change BOTH together if you switch configuration.
+geoservice.detectors = [os.environ["K4GEO"] + "/FCCee/IDEA/compact/IDEA_o1_v03/IDEA_3L_30cm.xml"]
 geoservice.OutputLevel = INFO
 geoservice.EnableGeant4Geo = False
 
@@ -25,6 +34,29 @@ standaloneMuonTracking.ParticleType = "muon"                  # Particle type fo
 standaloneMuonTracking.EncodingStringParameterName = "MuonSystemReadoutID"
 standaloneMuonTracking.OutputLevel = INFO
 
+# ── Readout schema ───────────────────────────────────────────────────────────
+# The component is readout-agnostic: only the cellID FIELD NAMES are assumed.
+#   MuonSystemReadoutID   : system:5,type:-2,layer:2,chamber:13,slice:1,y:-10,z:-10
+#   GlobalTrackerReadoutID: system:5,side:-2,layer:5,module:12,sensor:8
+# "type" and "side" are both signed 2-bit with the same 0 / +1 / -1 meaning
+# barrel / +endcap / -endcap, so only the name differs. initialize() validates
+# these against the actual encoding and fails loudly on a mismatch.
+standaloneMuonTracking.RegionFieldName = "type"               # "side" for GlobalTrackerReadoutID
+standaloneMuonTracking.LayerFieldName  = "layer"
+# Fold the cellID "system" field into the per-layer key. -1 = auto (on when
+# DetectorNames lists more than one detector), 0 = off, 1 = on. Required when a
+# readout spans several subdetectors, else e.g. VertexBarrel layer 0 and SiWrB
+# layer 0 collapse onto the same key. Irrelevant for the single-DetElement
+# muon system, where it is a constant offset.
+standaloneMuonTracking.UseSystemInCompositeID = -1
+# DetectorNames merges the surface maps of several DetElements sharing one
+# readout (GlobalTrackerReadoutID covers Vertex, SiWrB, SiWrD). Leave empty to
+# use DetectorName alone, as here.
+# standaloneMuonTracking.DetectorNames = ["Vertex", "SiWrB", "SiWrD"]
+
+# See runGlobalTrackerTracking.py in this directory for the full
+# GlobalTrackerReadoutID configuration, including MergeTrackerHitPlanes.
+
 # GenFit configuration
 standaloneMuonTracking.UseGenFit = False                      # Enable GenFit track fitting
 standaloneMuonTracking.MaxFitIterations = 100                 # Maximum iterations for the Kalman fit
@@ -33,11 +65,11 @@ standaloneMuonTracking.DoInnerPropagation = False
 standaloneMuonTracking.InnerPropTargetRadius = 100.0          # target radius in cm if enabled
 
 # ── N-hit combinatorial strategy ─────────────────────────────────────────────
-standaloneMuonTracking.MinTrackHits = 4                       # minimum hits to form a track
+standaloneMuonTracking.MinTrackHits = 3                       # minimum hits to form a track
 standaloneMuonTracking.MaxCombinatorialHits = 8               # cap on k in C(N,k) enumeration
 standaloneMuonTracking.NHitMaxChi2NDF = 10.0                  # max chi2/NDF of N-hit circle fit
 standaloneMuonTracking.HitIsolationCut = 0                    # min cross-region distance (cm); 0 to disable
-standaloneMuonTracking.MinLayerSpan = 4                       # min distinct detector layers per combo
+standaloneMuonTracking.MinLayerSpan = 3                       # min distinct detector layers per combo
 standaloneMuonTracking.MaxComboPT = 200.0                     # GeV: maximum combo pT (excludes combos above this threshold during search)
 standaloneMuonTracking.OutlierSigma = 5.0                     # outlier removal threshold (σ units)
 standaloneMuonTracking.SigmaHitDefault = 0.04                 # default hit resolution (cm = 0.4 mm)
@@ -57,6 +89,10 @@ standaloneMuonTracking.MaxHitsPerCompositeID = 3              # 0 = use all hits
 standaloneMuonTracking.NeighbourTrackMaxDist = 10.0           # cm (= 50 mm)
 standaloneMuonTracking.NeighbourTrackMinHits = 5              # must have >=4 hits
 standaloneMuonTracking.NeighbourTrackMaxChi2NDF = 3.0         # must have chi2/NDF <= 3
+# Max 3D distance (mm) between two hits treated as a paired-layer doublet.
+# 250 mm suits muon-system paired layers (12-24 cm apart); scale it down for
+# inner-tracker readouts where layers sit millimetres apart.
+standaloneMuonTracking.PairCoincidenceMaxDistMM = 250.0
 # Guided crowded-layer hit selection
 standaloneMuonTracking.doCrowdedLayerHitSelection = False     # enable guided crowded-layer hit selection
 
@@ -69,14 +105,14 @@ standaloneMuonTracking.OutputRecoSimLinkCollection = ["StandaloneMuonTrackHitSim
 
 # Input/Output service
 iosvc = IOSvc()
-iosvc.Input = "input_digi.root"
-iosvc.Output = "output_standalone_muon_tracks.root"
+iosvc.Input = "/eos/user/m/maali/output_files/performance/3L_uGun_IDEA_MS_digi_100k.root"
+iosvc.Output = "test_stdMuonTracks.root"
 
 # Application manager configuration
 ApplicationMgr(
     TopAlg=[standaloneMuonTracking],
     EvtSel="NONE",
-    EvtMax=1,
+    EvtMax=-1,
     ExtSvc=[EventDataSvc("EventDataSvc")],
     OutputLevel=INFO
 )

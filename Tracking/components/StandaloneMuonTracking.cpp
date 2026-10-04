@@ -75,12 +75,81 @@ StatusCode StandaloneMuonTracking::initialize() {
     std::string cellIDEncodingString = m_geoSvc->constantAsString(m_encodingStringParameter);
     m_bitFieldCoder = std::make_unique<dd4hep::DDSegmentation::BitFieldCoder>(cellIDEncodingString);
     
-    // Get surface map
+    // Validate the configured cellID field names against the actual encoding, so a
+    // readout mismatch fails loudly here instead of silently decoding garbage later.
+    {
+        const auto& desc = m_bitFieldCoder->fieldDescription();
+        auto hasField = [&](const std::string& n) {
+            for (const auto& f : m_bitFieldCoder->fields())
+                if (f.name() == n) return true;
+            return false;
+        };
+        if (!hasField(m_layerFieldName.value())) {
+            error() << "Readout '" << m_encodingStringParameter.value() << "' (" << desc
+                    << ") has no field '" << m_layerFieldName.value()
+                    << "'. Set LayerFieldName to match this readout." << endmsg;
+            return StatusCode::FAILURE;
+        }
+        m_hasRegionField = hasField(m_regionFieldName.value());
+        if (!m_hasRegionField) {
+            warning() << "Readout '" << m_encodingStringParameter.value() << "' (" << desc
+                      << ") has no field '" << m_regionFieldName.value()
+                      << "'; treating every hit as barrel. Set RegionFieldName "
+                      << "(\"type\" for MuonSystemReadoutID, \"side\" for GlobalTrackerReadoutID)."
+                      << endmsg;
+        }
+        // Fold "system" into the layer key when one readout spans several
+        // subdetectors, else identically-numbered layers in different subdetectors
+        // collide (GlobalTrackerReadoutID: VertexBarrel layer 0 vs SiWrB layer 0).
+        const bool multiDet = m_detectorNames.value().size() > 1;
+        if (m_systemInCompositeID.value() < 0)
+            m_useSystemInCompositeID = multiDet && hasField("system");
+        else
+            m_useSystemInCompositeID = (m_systemInCompositeID.value() != 0);
+        if (m_useSystemInCompositeID && !hasField("system")) {
+            error() << "UseSystemInCompositeID requested but readout '"
+                    << m_encodingStringParameter.value() << "' has no 'system' field." << endmsg;
+            return StatusCode::FAILURE;
+        }
+        if (multiDet && !m_useSystemInCompositeID) {
+            warning() << m_detectorNames.value().size() << " detectors share this readout but "
+                      << "'system' is NOT folded into the layer key -- layers with the same "
+                      << "index in different subdetectors will be merged." << endmsg;
+        }
+
+        info() << "CellID decoding: layer field '" << m_layerFieldName.value()
+               << "', region field '" << m_regionFieldName.value()
+               << (m_hasRegionField ? "'" : "' (absent, barrel-only)")
+               << ", system in layer key: " << (m_useSystemInCompositeID ? "yes" : "no") << endmsg;
+    }
+
+    // Get surface map. One readout can span several DetElements — GlobalTrackerReadoutID
+    // covers VertexBarrel, VertexEndcap, SiWrB and SiWrD — so merge their maps when
+    // DetectorNames is given, and fall back to the single DetectorName otherwise.
     auto surfaceMan = m_detector->extension<dd4hep::rec::SurfaceManager>();
-    m_surfaceMap = surfaceMan->map(m_detectorName);
-    if (!m_surfaceMap) {
-        error() << "Could not find surface map for detector: " << m_detectorName << endmsg;
-        return StatusCode::FAILURE;
+    std::vector<std::string> detNames = m_detectorNames.value();
+    if (detNames.empty()) detNames.push_back(m_detectorName.value());
+
+    if (detNames.size() == 1) {
+        m_surfaceMap = surfaceMan->map(detNames.front());
+        if (!m_surfaceMap) {
+            error() << "Could not find surface map for detector: " << detNames.front() << endmsg;
+            return StatusCode::FAILURE;
+        }
+    } else {
+        m_mergedSurfaceMap.clear();
+        for (const auto& name : detNames) {
+            const auto* m = surfaceMan->map(name);
+            if (!m) {
+                error() << "Could not find surface map for detector: " << name << endmsg;
+                return StatusCode::FAILURE;
+            }
+            m_mergedSurfaceMap.insert(m->begin(), m->end());
+            info() << "  merged " << m->size() << " surfaces from '" << name << "'" << endmsg;
+        }
+        m_surfaceMap = &m_mergedSurfaceMap;
+        info() << "Merged surface map over " << detNames.size() << " detectors: "
+               << m_surfaceMap->size() << " surfaces" << endmsg;
     }
 
     // Get magnetic field
@@ -302,7 +371,7 @@ std::tuple<edm4hep::TrackCollection,
                    << " GeV  phi=" << std::setprecision(3) << ts.phi
                    << " rad  eta=" << std::setprecision(3) << eta_out
                    << "  d0=" << std::setprecision(2) << ts.D0/10.0 << " cm"
-                   << "  z0=" << ts.Z0/10.0 << " cm  (z at innermost hit)" << endmsg;
+                   << "  z0=" << ts.Z0/10.0 << " cm  (perigee, EDM4hep convention)" << endmsg;
             hasOuter = true;
             break;
         }
@@ -543,28 +612,39 @@ const dd4hep::rec::Surface* StandaloneMuonTracking::findSurfaceByID(uint64_t cel
     return nullptr;
 }
 
-// Extract Type (Barrel, Endcap) ID from cell ID
+// Extract the barrel/endcap region ID from a cell ID.
+// The field is called "type" in MuonSystemReadoutID and "side" in
+// GlobalTrackerReadoutID; both are signed 2-bit with 0 / +1 / -1 meaning
+// barrel / +endcap / -endcap, so only the name is configurable.
 int StandaloneMuonTracking::getTypeID(uint64_t cellID) const {
-    // Use BitFieldCoder to extract type ID
-    return m_bitFieldCoder->get(cellID, "type");
+    if (!m_hasRegionField) return 0;   // single-region readout: treat everything as barrel
+    return m_bitFieldCoder->get(cellID, m_regionFieldName.value());
 }
 
 // Extract layer ID from cell ID
 int StandaloneMuonTracking::getLayerID(uint64_t cellID) const {
-    // Use BitFieldCoder to extract layer ID
-    return m_bitFieldCoder->get(cellID, "layer");
+    return m_bitFieldCoder->get(cellID, m_layerFieldName.value());
 }
 
-// Compute composite layer ID that encodes both region and layer number:
-//   barrel:    compositeID = layerID
-//   +endcap:   compositeID = 1000 + layerID
-//   -endcap:   compositeID = -1000 - layerID
+// Compute composite layer ID that encodes subdetector, region and layer number:
+//   barrel:    compositeID =  100*system + layerID
+//   +endcap:   compositeID =  100*system + layerID + 1000
+//   -endcap:   compositeID = -(100*system + layerID + 1000)
+//
+// The system term matters as soon as one readout spans several subdetectors:
+// under GlobalTrackerReadoutID, VertexBarrel layer 0 and SiWrB layer 0 are BOTH
+// barrel with side=0 and would otherwise collapse onto the same key, merging two
+// layers ~30 cm apart into one. With a single-subdetector readout (the muon
+// system) every hit shares one system value, so this is a constant offset and
+// the behaviour is unchanged.
 int StandaloneMuonTracking::getCompositeID(uint64_t cellID) const {
     int layerID = getLayerID(cellID);
     int typeID  = getTypeID(cellID);
-    if      (typeID ==  0) return layerID;
-    else if (typeID ==  1) return  1000 + layerID;
-    else                   return -1000 - layerID;
+    int base    = layerID;
+    if (m_useSystemInCompositeID) base += 100 * m_bitFieldCoder->get(cellID, "system");
+    if      (typeID ==  0) return base;
+    else if (typeID ==  1) return  1000 + base;
+    else                   return -1000 - base;
 }
 
 // Group surfaces by detector layer
@@ -584,24 +664,15 @@ std::map<int, std::vector<const dd4hep::rec::Surface*>> StandaloneMuonTracking::
         
 
         // Get the layer ID
-        layerID = m_bitFieldCoder->get(volID, "layer");
+        layerID = getLayerID(volID);
+
+        // Region field ("type" for the muon system, "side" for the global tracker)
+        type = getTypeID(volID);
             
-        // Try to get the type field
-        type = m_bitFieldCoder->get(volID, "type");
-            
-        // Create a composite ID that distinguishes barrel and endcaps
-        // For barrel: layerID
-        // For endcaps: 1000 * type + layerID (1000+layerID for positive, -1000+layerID for negative)
-        int compositeID;
-        if (type == 0) {
-                // Barrel
-                compositeID = layerID;
-        } else if (type == 1) {
-                // Endcaps
-                compositeID = 1000 * type + layerID;
-        } else {
-                compositeID = 1000 * type - layerID;
-        }
+        // Same composite key as the hits use, so surfaces and hits stay in step
+        // (this also folds in the system field when several subdetectors share
+        // one readout -- see getCompositeID()).
+        const int compositeID = getCompositeID(volID);
             
         // Add surface to the appropriate layer group
         result[compositeID].push_back(surface);
@@ -668,6 +739,62 @@ double StandaloneMuonTracking::getPT(const edm4hep::TrackState& state) const {
     double pT = 0.3 * std::abs(bField) / std::abs(omega) * 0.001; // GeV/c
 
     return pT;
+}
+
+// Convert the outer-segment (AtLastHit) state from the internal circle-fit convention to
+// the EDM4hep helix convention, so that consumers can use the five parameters directly.
+//
+// Internal convention (used by the circle fit, the GenFit seed and the inner propagation):
+//   d0 = |centre| - R and omega = charge/R: the helix built from these with the EDM4hep
+//   formulas does NOT pass through the hits -- both signs are opposite to EDM4hep;
+//   Z0 = z at the first muon hit (s = 0 at that hit), not at the perigee.
+// Stored convention (EDM4hep): d0 -> -d0, omega -> -omega (phi unchanged), and Z0 moved to
+//   the perigee: Z0 -> Z0 - tanLambda * s*, with s* the transverse arc length from the
+//   perigee to the first hit along the circle. d0, phi, omega, Z0, tanLambda are then all
+//   defined at the perigee with respect to the origin.
+// The referencePoint is deliberately left at the first muon hit.
+// Covariance: Jacobian diag(-1, 1, -1, 1, 1) plus dZ0'/dtanLambda = -s* (the dependence of
+//   s* on the circle parameters is neglected).
+// Note: this segment lives in the return field, so the sign of omega describes the
+//   geometric sense of rotation, not the charge in the EDM4hep (B along +z) sense.
+static void toPerigeeConvention(edm4hep::TrackState& state) {
+    const double d0        = -state.D0;
+    const double omega     = -state.omega;
+    const double phi       = state.phi;
+    const double tanLambda = state.tanLambda;
+    if (std::abs(omega) < 1e-12)
+        return;
+    const double radius  = 1.0 / omega;  // signed
+    const double centreX = (radius - d0) * std::sin(phi);
+    const double centreY = -(radius - d0) * std::cos(phi);
+    const double perigeeX = -d0 * std::sin(phi);
+    const double perigeeY = d0 * std::cos(phi);
+    const double anglePerigee = std::atan2(perigeeY - centreY, perigeeX - centreX);
+    const double angleFirstHit =
+        std::atan2(state.referencePoint[1] - centreY, state.referencePoint[0] - centreX);
+    double dAngle = anglePerigee - angleFirstHit;
+    while (dAngle > M_PI) dAngle -= 2.0 * M_PI;
+    while (dAngle < -M_PI) dAngle += 2.0 * M_PI;
+    const double sStar = dAngle / omega;  // arc length perigee -> first hit
+
+    using TP = edm4hep::TrackParams;
+    const double varZ0   = state.getCovMatrix(TP::z0, TP::z0);
+    const double varTanL = state.getCovMatrix(TP::tanLambda, TP::tanLambda);
+    const double covZ0T  = state.getCovMatrix(TP::z0, TP::tanLambda);
+    // sign flips: covariances pairing d0 or omega with phi/z0/tanLambda change sign
+    for (TP a : {TP::d0, TP::omega})
+        for (TP b : {TP::phi, TP::z0, TP::tanLambda})
+            state.setCovMatrix(-state.getCovMatrix(a, b), a, b);
+    // z0 shift along the helix
+    state.setCovMatrix(static_cast<float>(varZ0 - 2.0 * sStar * covZ0T + sStar * sStar * varTanL), TP::z0, TP::z0);
+    state.setCovMatrix(static_cast<float>(covZ0T - sStar * varTanL), TP::z0, TP::tanLambda);
+    for (TP a : {TP::d0, TP::phi, TP::omega})
+        state.setCovMatrix(static_cast<float>(state.getCovMatrix(a, TP::z0) - sStar * state.getCovMatrix(a, TP::tanLambda)),
+                           a, TP::z0);
+
+    state.D0    = static_cast<float>(d0);
+    state.omega = static_cast<float>(omega);
+    state.Z0    = static_cast<float>(state.Z0 - tanLambda * sStar);
 }
 
 // EDM4HEP Track state
@@ -741,11 +868,19 @@ void StandaloneMuonTracking::findTracks(
     // both in the same readout cell). Keeping only one would drop the others
     // and bias downstream MC-truth checks (purity, fake rate) low for cluster
     // digi. For baseline (1 SimHit per digi) the vector simply has size 1.
-    std::unordered_map<uint32_t, std::vector<edm4hep::SimTrackerHit>> recoToSimMap;
+    // Key on (collectionID, index), NOT index alone: when one readout spans several
+    // subdetectors the hits arrive merged from several source collections, whose
+    // indices both start at 0 and would otherwise collide, silently attaching the
+    // wrong SimTrackerHit to a hit from a different subdetector.
+    auto hitKey = [](const auto& h) -> uint64_t {
+        const auto id = h.id();
+        return (static_cast<uint64_t>(id.collectionID) << 32) | static_cast<uint32_t>(id.index);
+    };
+    std::unordered_map<uint64_t, std::vector<edm4hep::SimTrackerHit>> recoToSimMap;
     for (const auto& link : recoSimLinks) {
         // link.getFrom() is a TrackerHit interface — get the underlying object ID
         auto recoHit = link.getFrom();
-        recoToSimMap[recoHit.id().index].push_back(link.getTo());
+        recoToSimMap[hitKey(recoHit)].push_back(link.getTo());
     }
 
     // ── MC truth overview: list all unique MCParticles associated with event hits ─
@@ -755,7 +890,7 @@ void StandaloneMuonTracking::findTracks(
         std::unordered_set<int> seenMCIdx;
         int nLinked = 0;
         for (size_t gi = 0; gi < hits->size(); ++gi) {
-            auto it = recoToSimMap.find((*hits)[gi].id().index);
+            auto it = recoToSimMap.find(hitKey((*hits)[gi]));
             if (it == recoToSimMap.end()) continue;
             nLinked++;
             // Iterate over every SimHit contributing to this digi hit; for
@@ -796,7 +931,7 @@ void StandaloneMuonTracking::findTracks(
     // to one; baseline digi yields exactly one link per hit as before.
     auto propagateLink = [&](const edm4hep::MutableTrackerHitPlane& outHit,
                               const edm4hep::TrackerHitPlane& inHit) {
-        auto it = recoToSimMap.find(inHit.id().index);
+        auto it = recoToSimMap.find(hitKey(inHit));
         if (it == recoToSimMap.end()) return;
         for (const auto& sim : it->second) {
             auto outLink = outputLinks.create();
@@ -1416,7 +1551,9 @@ void StandaloneMuonTracking::findTracks(
         //   3D distance ≤ 250 mm (paired layers are 12 cm apart, max 24 cm)
         constexpr double kPairTolPhi    = 0.15;
         constexpr double kPairTolEta    = 0.10;
-        constexpr double kPairMaxDistMM = 250.0;
+        // Detector-scale dependent: 250 mm suits muon-system paired layers, but is
+        // meaningless in a vertex detector where layers sit mm apart. Configurable.
+        const double kPairMaxDistMM = m_pairCoincMaxDistMM.value();
 
         auto coincidentHits = [&](const edm4hep::TrackerHitPlane& a,
                                   const edm4hep::TrackerHitPlane& b) -> bool {
@@ -2677,6 +2814,11 @@ void StandaloneMuonTracking::findTracks(
         debug() << "Created new final track object for track " << trackNumber << endmsg;
 
 
+        // The AtLastHit state in the internal circle-fit convention. It seeds GenFit and starts
+        // the inner propagation; only the EDM4hep-convention copy (toPerigeeConvention) is stored.
+        edm4hep::TrackState internalLastHitState;
+        bool haveInternalLastHit = false;
+
         // N-hit circle fit: use the precomputed bestCombo result (already outlier-rejected).
         if (trackHits.size() >= 3) {
             {
@@ -2762,7 +2904,7 @@ void StandaloneMuonTracking::findTracks(
                     // MC truth debug: extract charge and momentum from the MCParticle
                     // linked to the first hit via the RecoSim map built at the top of findTracks.
                     {
-                        auto mcIt = recoToSimMap.find(trackHits[0].id().index);
+                        auto mcIt = recoToSimMap.find(hitKey(trackHits[0]));
                         if (mcIt != recoToSimMap.end() && !mcIt->second.empty()) {
                             // Pick a muon SimHit if any contributed to this digi
                             // hit, otherwise fall back to the first contributor.
@@ -2931,11 +3073,21 @@ void StandaloneMuonTracking::findTracks(
                         << "  σ_tanL=" << std::sqrt(var_tanL)
                         << endmsg;
                 }
-                    finalTrack.addToTrackStates(circleFitState);
-                    // NDF = 2*n_hits - 5
-                    // Each hit gives 2 measurements (2D detector: x, y).
-                    // Helix has 5 free parameters: d0, phi0, omega, z0, tanLambda.
-                    const int fitNdf = std::max(0, 2 * static_cast<int>(trackHits.size()) - 5);
+                    internalLastHitState = circleFitState;
+                    haveInternalLastHit = true;
+                    {
+                        edm4hep::TrackState storedLastHit = circleFitState;
+                        toPerigeeConvention(storedLastHit);
+                        finalTrack.addToTrackStates(storedLastHit);
+                    }
+                    // NDF = n_hits - 3, matching the fit that produced this chi2.
+                    // fitCircleNHits() forms ONE radial residual per hit and fits three
+                    // circle parameters (x0, y0, R), so the dof is n_hits - 3 -- not the
+                    // 2*n_hits - 5 of a 5-parameter helix with two measurements per hit.
+                    // Using the helix formula here made the stored raw chi2 inconsistent
+                    // with the stored ndf (only their ratio came out right), so a chi2
+                    // probability computed from the output file was wrong.
+                    const int fitNdf = std::max(1, static_cast<int>(trackHits.size()) - 3);
                     finalTrack.setChi2(static_cast<float>(chi2 * fitNdf));   // store raw chi2
                     finalTrack.setNdf(fitNdf);
 
@@ -2975,7 +3127,9 @@ void StandaloneMuonTracking::findTracks(
                 debug() << "Using analytical seed parameters for track " << trackNumber << " (GenFit disabled)" << endmsg;
             }
 
-            finalTrack.setNdf(std::max(1, static_cast<int>(trackHits.size() * 2 - 5)));
+            // Same dof as the circle fit above (n_hits - 3); this branch runs whenever
+            // GenFit is off or failed, and must not clobber the ndf set with the chi2.
+            finalTrack.setNdf(std::max(1, static_cast<int>(trackHits.size()) - 3));
 
             // seedTrack carries no states (N-hit params are stored in bestCombo);
             // AtLastHit is added by the circle fit block above when GenFit is skipped.
@@ -3019,16 +3173,11 @@ void StandaloneMuonTracking::findTracks(
                 break;
             }
         }
-        if (!foundStateForProp) {
-            for (int j = 0; j < finalTrack.trackStates_size(); ++j) {
-                auto st = finalTrack.getTrackStates(j);
-                if (st.location == edm4hep::TrackState::AtLastHit) {
-                    bestState = st;
-                    foundStateForProp = true;
-                    debug() << "Using AtLastHit state (N-hit circle) for inner propagation" << endmsg;
-                    break;
-                }
-            }
+        if (!foundStateForProp && haveInternalLastHit) {
+            // internal convention (the stored AtLastHit copy is in the EDM4hep convention)
+            bestState = internalLastHitState;
+            foundStateForProp = true;
+            debug() << "Using AtLastHit state (N-hit circle) for inner propagation" << endmsg;
         }
             
         // ===== INNER PROPAGATION =====
@@ -3167,7 +3316,7 @@ void StandaloneMuonTracking::findTracks(
                     edm4hep::MCParticle bestMCpart;
                     bool hasMCpart = false;
                     for (const auto& th : trackHits) {
-                        auto it = recoToSimMap.find(th.id().index);
+                        auto it = recoToSimMap.find(hitKey(th));
                         if (it == recoToSimMap.end()) continue;
                         // Prefer a muon contributor when the digi-hit has several.
                         for (const auto& sim : it->second) {
@@ -3265,7 +3414,7 @@ void StandaloneMuonTracking::findTracks(
             // Tally MCParticle associations across all track hits
             std::unordered_map<int, std::pair<edm4hep::MCParticle, int>> mcCount;
             for (const auto& th : trackHits) {
-                auto it = recoToSimMap.find(th.id().index);
+                auto it = recoToSimMap.find(hitKey(th));
                 if (it == recoToSimMap.end()) continue;
                 // Count every MCParticle that contributed to this digi-hit,
                 // deduplicating within the same hit so one cluster doesn't
@@ -4362,10 +4511,15 @@ bool StandaloneMuonTracking::fitCircleNHits(
         const auto& pos = hits[i].getPosition();
         pts[i] = { pos[0] / 10.0, pos[1] / 10.0 };
         double su = hits[i].getDu();
-        double sv = hits[i].getDv();
         if (su <= 0) su = m_sigmaHitDefault.value() * 10.0;  // property is in cm, du is in mm
-        if (sv <= 0) sv = m_sigmaHitDefault.value() * 10.0;
-        sigma[i] = std::sqrt(su*su + sv*sv) / 10.0;  // convert mm → cm
+        // The fit forms a single SCALAR radial residual per hit (see step 4), so the
+        // weight must be a single 1D uncertainty. Adding du and dv in quadrature here
+        // described a 2D position error and inflated sigma by up to sqrt(2) (exactly
+        // sqrt(2) when du == dv, as the muon-system digitiser produces), which deflated
+        // chi2 by a factor 2. Use the precise measurement coordinate du instead.
+        // NOTE: strictly the radial direction should be projected onto the local (u,v)
+        // axes; du is the right scale for the bending-plane residual in this geometry.
+        sigma[i] = su / 10.0;  // convert mm → cm
         w[i]     = 1.0 / (sigma[i] * sigma[i]);
     }
 

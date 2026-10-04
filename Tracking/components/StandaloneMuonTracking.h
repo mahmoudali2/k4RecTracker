@@ -333,8 +333,27 @@ private:
     
     // Properties
     Gaudi::Property<std::string> m_detectorName{this, "DetectorName", "Tracker", "Name of detector to process"};
+    Gaudi::Property<std::vector<std::string>> m_detectorNames{this, "DetectorNames", {},
+        "Optional list of detector names whose surface maps are merged. Use when one readout "
+        "spans several DetElements (e.g. GlobalTrackerReadoutID covers VertexBarrel, VertexEndcap, "
+        "SiWrB, SiWrD). If empty, DetectorName is used on its own."};
     Gaudi::Property<std::string> m_particleType{this, "ParticleType", "pion", "Particle type for material effects"};
     Gaudi::Property<std::string> m_encodingStringParameter{this, "EncodingStringParameterName", "GlobalTrackerReadoutID", "Name of DD4hep parameter with the encoding string"};
+    // CellID field names. Different readouts spell the same concepts differently:
+    //   MuonSystemReadoutID  : system:5,type:-2,layer:2,chamber:13,slice:1,y:-10,z:-10
+    //   GlobalTrackerReadoutID: system:5,side:-2,layer:6,module:11,sensor:8
+    // "type" and "side" are both signed 2-bit fields with the same 0 / +1 / -1
+    // barrel / +endcap / -endcap meaning, so only the NAME differs.
+    Gaudi::Property<std::string> m_regionFieldName{this, "RegionFieldName", "type",
+        "CellID field separating barrel (0) from +endcap (1) and -endcap (-1). "
+        "\"type\" for MuonSystemReadoutID, \"side\" for GlobalTrackerReadoutID."};
+    Gaudi::Property<std::string> m_layerFieldName{this, "LayerFieldName", "layer",
+        "CellID field holding the layer index."};
+    Gaudi::Property<int> m_systemInCompositeID{this, "UseSystemInCompositeID", -1,
+        "Fold the cellID 'system' field into the per-layer key. -1 = auto (on when "
+        "DetectorNames lists more than one detector), 0 = off, 1 = on. Required when "
+        "one readout spans several subdetectors, otherwise e.g. VertexBarrel layer 0 "
+        "and SiWrB layer 0 collapse onto the same key."};
     // GenFit properties
     Gaudi::Property<int> m_maxFitIterations{this, "MaxFitIterations", 4, "Maximum iterations for track fitting"};
     Gaudi::Property<bool> m_useGenFit{this, "UseGenFit", true, "Use GenFit for track fitting"};
@@ -452,6 +471,11 @@ private:
         "it runs a single pass over all hits, just with doublet-aware ranking. "
         "Default false (HARD mode, the validated direction 2)."};
 
+    Gaudi::Property<double> m_pairCoincMaxDistMM{this, "PairCoincidenceMaxDistMM", 250.0,
+        "Max 3D distance (mm) between two hits treated as a paired-layer doublet. "
+        "250 mm suits the muon system (paired layers 12-24 cm apart); scale it down "
+        "for inner-tracker readouts where layers are far closer."};
+
     // ── Neighbour-track quality gate ──────────────────────────────────────
     Gaudi::Property<double> m_neighbourTrackMaxDist{this, "NeighbourTrackMaxDist", 5.0,
         "If the best-combo candidate has any hit within this distance (cm) of a hit from "
@@ -480,6 +504,10 @@ private:
     std::map<int, std::vector<const dd4hep::rec::Surface*>> m_surfacesByLayer; // Surfaces grouped by layer
     ParticleProperties m_particleProperties;  // Particle properties for material effects
     std::unique_ptr<dd4hep::DDSegmentation::BitFieldCoder> m_bitFieldCoder; // For cell ID decoding
+    bool m_hasRegionField{true};   // false when the readout has no barrel/endcap field at all
+    bool m_useSystemInCompositeID{false};  // fold "system" into the layer key (multi-subdetector readouts)
+    // Owns the merged surface map when several detectors are combined (DetectorNames).
+    dd4hep::rec::SurfaceMap m_mergedSurfaceMap;
 
     int getPDGCode() const;
     
